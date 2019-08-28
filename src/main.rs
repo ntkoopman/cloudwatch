@@ -105,7 +105,9 @@ fn main() {
         hasher.result_str()
     };
 
-    let path = Path::new("/Users/admin/.local/cache/cloudwatch/").join(Path::new(&hash));
+    let cache_dir = dirs::cache_dir().unwrap().join(Path::new("cloudwatch"));
+    fs::create_dir_all(&cache_dir).expect("could not create cache dir");
+    let path = cache_dir.join(Path::new(&hash));
 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
