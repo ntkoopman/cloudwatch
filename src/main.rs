@@ -4,7 +4,6 @@ extern crate serde_derive;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::Command;
 use std::{fs, io};
 
 use chrono::{Local, TimeZone};
@@ -13,13 +12,21 @@ use clap::{App, Arg, ArgGroup};
 use colored::*;
 use crypto::digest::Digest;
 use crypto::sha1::Sha1;
-use serde_json::Value;
+use rusoto_core::Region;
+use rusoto_logs::{CloudWatchLogs, CloudWatchLogsClient, FilterLogEventsRequest};
 
-#[derive(Debug, Deserialize)]
-struct LogEvents {
-    events: Vec<Value>,
-    #[serde(rename = "nextToken")]
-    next_token: Option<String>,
+#[derive(Debug, Deserialize, Serialize)]
+struct LogEvent {
+    #[serde(rename = "eventId")]
+    event_id: Option<String>,
+    #[serde(rename = "ingestionTime")]
+    ingestion_time: Option<i64>,
+    #[serde(rename = "logStreamName")]
+    log_stream_name: Option<String>,
+    #[serde(rename = "message")]
+    message: Option<String>,
+    #[serde(rename = "timestamp")]
+    timestamp: Option<i64>,
 }
 
 const NEWLINE: &[u8] = &['\n' as u8];
@@ -120,7 +127,7 @@ fn main() {
             for line in file.lines() {
                 let string = line.unwrap();
                 let value = serde_json::from_str(&string).unwrap();
-                print_event(&value);
+                print_event(value);
             }
         } else {
             io::copy(&mut file, &mut stdout).unwrap();
@@ -130,52 +137,58 @@ fn main() {
 
     let now = Local::now();
     let to_timestamp = |x| {
-        let time = parse_date_string(x, now, Dialect::Uk).unwrap();
-        time.timestamp_millis().to_string()
+        parse_date_string(x, now, Dialect::Uk)
+            .unwrap()
+            .timestamp_millis()
     };
 
-    let mut args = Args::new();
-    args.add("--log-group-name", log_group_name);
-    args.add("--output", "json");
-    args.option("--start-time", start_time.map(to_timestamp));
-    args.option("--end-time", end_time.map(to_timestamp));
-    args.option("--filter-pattern", filter_pattern);
-    args.option("--log-stream-names", log_stream_name);
+    let client = CloudWatchLogsClient::new(Region::default());
 
     let temporary_path = path.with_extension("partial");
     let mut file = File::create(temporary_path.clone()).unwrap();
 
     // Custom paging to avoid loading the entire data set into memory
-    let mut remaining = max_items.map(|x| x.parse::<u32>().unwrap());
+    let mut remaining = max_items.map(|x| x.parse::<i64>().unwrap());
     let mut next_token = None;
 
     while remaining.is_none() || remaining.unwrap() > 0 {
-        let command = {
-            let mut command = Command::new("aws");
-            command
-                .env("LC_ALL", "en_US.UTF-8")
-                .arg("logs")
-                .arg("filter-log-events")
-                .arg("--no-paginate")
-                .args(&args.args)
-                .arg("--limit")
-                .arg(remaining.unwrap_or(1000).min(1000).to_string().as_str());
-            if let Some(token) = next_token {
-                command.arg("--next-token").arg(token);
-            }
-            command.output().unwrap()
+        let event = FilterLogEventsRequest {
+            end_time: end_time.map(to_timestamp),
+            filter_pattern: filter_pattern.map(|x| x.to_string()),
+            interleaved: Some(true),
+            limit: Some(remaining.unwrap_or(1000).min(1000)),
+            log_group_name: log_group_name.to_string(),
+            log_stream_name_prefix: None,
+            log_stream_names: log_stream_name.map(|x| vec![x.to_string()]),
+            next_token,
+            start_time: start_time.map(to_timestamp),
         };
 
-        if !command.status.success() {
-            std::io::stderr().write(&command.stderr).unwrap();
+        let response = client.filter_log_events(event).sync();
+        if let Err(e) = response {
+            std::io::stderr()
+                .write(format!("{:?}", e).as_bytes())
+                .unwrap();
             return;
         }
 
-        let response: LogEvents = serde_json::from_slice(&command.stdout).unwrap();
-        next_token = response.next_token;
+        let response = response.unwrap();
+        let events = response.events.unwrap();
 
-        for event in &response.events {
-            let json = event.to_string();
+        if let Some(count) = remaining {
+            remaining = Some(count - events.len() as i64);
+        }
+
+        for event in events {
+            let event = LogEvent {
+                event_id: event.event_id,
+                ingestion_time: event.ingestion_time,
+                log_stream_name: event.log_stream_name,
+                message: event.message,
+                timestamp: event.timestamp,
+            };
+
+            let json = serde_json::to_string(&event).unwrap();
             let bytes = json.as_bytes();
             file.write(bytes).unwrap();
             file.write(NEWLINE).unwrap();
@@ -187,10 +200,7 @@ fn main() {
             }
         }
 
-        if let Some(count) = remaining {
-            remaining = Some(count - *&response.events.len() as u32);
-        }
-
+        next_token = response.next_token;
         if next_token.is_none() {
             // At the end of the stream
             break;
@@ -200,43 +210,9 @@ fn main() {
     fs::rename(temporary_path, path).unwrap();
 }
 
-fn print_event(event: &Value) {
-    let timestamp = event
-        .as_object()
-        .unwrap()
-        .get("timestamp")
-        .unwrap()
-        .as_i64()
-        .unwrap();
-    let message = event
-        .as_object()
-        .unwrap()
-        .get("message")
-        .unwrap()
-        .as_str()
-        .unwrap();
+fn print_event(event: LogEvent) {
+    let timestamp = event.timestamp.unwrap();
+    let message = event.message.unwrap();
     let time = Local.timestamp_millis(timestamp);
     println!("{} {}", time.to_rfc3339().green(), message);
-}
-
-struct Args {
-    args: Vec<String>,
-}
-
-impl Args {
-    fn new() -> Args {
-        Args { args: vec![] }
-    }
-    fn add(&mut self, name: &str, value: &str) -> &mut Args {
-        self.args.push(name.into());
-        self.args.push(value.into());
-        self
-    }
-    fn option<T: Into<String>>(&mut self, name: &str, value: Option<T>) -> &mut Args {
-        if let Some(inner) = value {
-            self.args.push(name.into());
-            self.args.push(inner.into());
-        }
-        self
-    }
 }
